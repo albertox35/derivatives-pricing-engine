@@ -146,6 +146,56 @@ def test_el_mc_es_reproducible_con_la_misma_semilla():
     assert a.standard_error == b.standard_error
 
 
+def test_el_resultado_no_depende_del_numero_de_hilos():
+    """Reproducibilidad bit a bit frente al paralelismo.
+
+    Es una exigencia mas fuerte que repetir la misma llamada, y la que de verdad
+    hace auditable un calculo: el mismo insumo tiene que dar el mismo numero sin
+    importar cuantos nucleos use la maquina que lo ejecute.
+
+    Una reduccion de OpenMP corriente **no** lo cumple, porque el arbol de
+    combinacion depende del numero de hilos que el runtime decida usar. El
+    nucleo acumula por bloques de numero fijo y los combina en orden de indice,
+    precisamente para que no dependa.
+
+    El sintoma que lo destapo: con la formula de varianza de libro de texto, una
+    diferencia de 1 ULP en la suma de cuadrados se amplificaba por cancelacion
+    catastrofica hasta hacerse visible en el error estandar. El precio coincidia
+    y el error estandar no.
+    """
+    referencia = price_mc(S, K, R, Q, V, T, Payoff.CALL, 8192, 8, seed=42, n_threads=1)
+    for hilos in (2, 4, 8, 16):
+        r = price_mc(S, K, R, Q, V, T, Payoff.CALL, 8192, 8, seed=42, n_threads=hilos)
+        assert r.price == referencia.price, f"precio difiere con {hilos} hilos"
+        assert r.standard_error == referencia.standard_error, (
+            f"error estandar difiere con {hilos} hilos: "
+            f"{r.standard_error!r} frente a {referencia.standard_error!r}"
+        )
+
+
+def test_el_estimador_de_varianza_es_estable():
+    """Welford frente a la formula de libro de texto.
+
+    Con payoffs del orden de 10 y desviacion del orden de 0.15, la suma de
+    cuadrados es unas cuatro ordenes de magnitud mayor que la varianza buscada.
+    La formula `(sum_sq - n*media^2)/(n-1)` resta dos cantidades casi iguales y
+    pierde digitos significativos; Welford nunca forma esa diferencia.
+
+    Se comprueba contra la varianza que NumPy calcula en doble precision sobre
+    la misma cantidad de rutas, por una via independiente.
+    """
+    import numpy as np
+
+    res = price_mc(S, K, R, Q, V, T, Payoff.CALL, 131_072, 1, seed=99, n_threads=1)
+    # Reconstruir los payoffs en Python a partir de la misma secuencia.
+    rng = np.random.default_rng(99)
+    z = rng.standard_normal((131_072, 1))
+    s_t = S * np.exp((R - Q - 0.5 * V**2) * T + V * np.sqrt(T) * z[:, 0])
+    valores = np.exp(-R * T) * np.maximum(s_t - K, 0.0)
+    esperado = float(np.std(valores, ddof=1) / np.sqrt(valores.size))
+    assert res.standard_error == pytest.approx(esperado, rel=1e-12)
+
+
 def test_el_puente_no_altera_el_precio_del_payoff_terminal():
     """Para un call europeo el puente cambia el orden, no la distribucion.
 

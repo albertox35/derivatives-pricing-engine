@@ -158,6 +158,56 @@ inline void fill_brownian_path(const BridgeSchedule& s, const double* normals, d
 
 enum class PayoffKind { Call = 0, Put = 1, AsianCall = 2, AsianPut = 3, LookbackCall = 4 };
 
+// ------------------------------------------- reduccion estable y reproducible
+
+// Numero FIJO de bloques de reduccion. La clave esta en que no depende del
+// numero de hilos: cada bloque acumula de forma secuencial y los bloques se
+// combinan despues en orden de indice, asi que el resultado es identico bit a
+// bit con 1 hilo, con 8 o con 64.
+//
+// Con una reduccion de OpenMP corriente eso no se cumple: el arbol de
+// combinacion depende del numero de hilos que el runtime decida usar, que puede
+// variar entre ejecuciones de la misma maquina. Se detecto porque CI en Linux
+// fallaba la prueba de reproducibilidad que en Windows pasaba.
+constexpr std::size_t kReductionChunks = 64;
+
+// Acumulador de Welford: media y suma de desviaciones al cuadrado.
+//
+// La formula de libro de texto para la varianza, `(sum_sq - n*mean^2)/(n-1)`,
+// resta dos cantidades grandes y casi iguales. Con payoffs del orden de 10 y
+// una desviacion del orden de 0.15, `sum_sq` es unas cuatro ordenes de magnitud
+// mayor que el resultado buscado: una diferencia de 1 ULP en `sum_sq` se
+// amplifica hasta hacerse visible en la varianza. Welford nunca forma esa
+// diferencia, asi que no hay nada que amplificar.
+struct Moments {
+    double n = 0.0;
+    double mean = 0.0;
+    double m2 = 0.0;
+
+    void add(double x) noexcept {
+        n += 1.0;
+        const double delta = x - mean;
+        mean += delta / n;
+        m2 += delta * (x - mean);
+    }
+
+    // Combinacion de Chan, Golub y LeVeque (1979) para dos acumuladores.
+    void merge(const Moments& o) noexcept {
+        if (o.n == 0.0) return;
+        if (n == 0.0) {
+            *this = o;
+            return;
+        }
+        const double total = n + o.n;
+        const double delta = o.mean - mean;
+        mean += delta * o.n / total;
+        m2 += o.m2 + delta * delta * n * o.n / total;
+        n = total;
+    }
+
+    double variance() const noexcept { return n > 1.0 ? m2 / (n - 1.0) : 0.0; }
+};
+
 }  // namespace
 
 // ------------------------------------------------- Monte Carlo sobre GBM
@@ -190,8 +240,12 @@ py::dict price_gbm(py::array_t<double, py::array::c_style | py::array::forcecast
     const double drift = (rate - dividend - 0.5 * vol * vol) * dt;
     const double discount = std::exp(-rate * maturity);
 
-    double sum = 0.0;
-    double sum_sq = 0.0;
+    // Acumuladores de Welford por bloque. Ver la nota de `Moments` mas abajo:
+    // el numero de bloques es FIJO y no depende del numero de hilos, que es lo
+    // que hace el resultado reproducible bit a bit.
+    const std::size_t n_chunks =
+        std::min<std::size_t>(kReductionChunks, std::max<std::size_t>(n_paths, 1));
+    std::vector<Moments> chunk_moments(n_chunks);
 
     {
         py::gil_scoped_release release;  // el computo no toca objetos de Python
@@ -202,7 +256,7 @@ py::dict price_gbm(py::array_t<double, py::array::c_style | py::array::forcecast
 #endif
 
 #ifdef _OPENMP
-#pragma omp parallel reduction(+ : sum, sum_sq)
+#pragma omp parallel
 #endif
         {
             // Buffers por hilo, asignados una sola vez fuera del bucle de rutas.
@@ -211,8 +265,13 @@ py::dict price_gbm(py::array_t<double, py::array::c_style | py::array::forcecast
 #ifdef _OPENMP
 #pragma omp for schedule(static)
 #endif
-            for (std::ptrdiff_t p = 0; p < static_cast<std::ptrdiff_t>(n_paths); ++p) {
-                const double* row = z + static_cast<std::size_t>(p) * n_steps;
+            for (std::ptrdiff_t c = 0; c < static_cast<std::ptrdiff_t>(n_chunks); ++c) {
+              const std::size_t desde = (n_paths * static_cast<std::size_t>(c)) / n_chunks;
+              const std::size_t hasta = (n_paths * static_cast<std::size_t>(c + 1)) / n_chunks;
+              Moments bloque;
+
+              for (std::size_t p = desde; p < hasta; ++p) {
+                const double* row = z + p * n_steps;
 
                 if (use_bridge) {
                     fill_brownian_path(schedule, row, dt, w.data(), n_steps);
@@ -255,16 +314,25 @@ py::dict price_gbm(py::array_t<double, py::array::c_style | py::array::forcecast
                         break;
                 }
                 const double value = discount * payoff;
-                sum += value;
-                sum_sq += value * value;
+                bloque.add(value);
+              }
+
+              chunk_moments[static_cast<std::size_t>(c)] = bloque;
             }
         }
     }
 
-    const double n = static_cast<double>(n_paths);
-    const double mean = sum / n;
-    // Varianza muestral; con n = 1 no esta definida.
-    const double var = n > 1.0 ? std::max((sum_sq - n * mean * mean) / (n - 1.0), 0.0) : 0.0;
+    // Combinacion en orden de indice de bloque. Este bucle es secuencial y su
+    // orden esta fijado por el indice, no por el reparto de hilos: ahi esta la
+    // reproducibilidad.
+    Moments total;
+    for (const Moments& m : chunk_moments) {
+        total.merge(m);
+    }
+
+    const double n = total.n;
+    const double mean = total.mean;
+    const double var = std::max(total.variance(), 0.0);
 
     py::dict out;
     out["price"] = mean;

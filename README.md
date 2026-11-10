@@ -190,6 +190,31 @@ es una característica, es deuda técnica duplicada. Se eligió C++ porque el
 ecosistema quant existente lo es, y pybind11 porque está más maduro que PyO3 para
 numérico con buffers de NumPy.
 
+**La reducción paralela es determinista, y la varianza se acumula con Welford.**
+Esto empezó como un fallo de CI: la prueba de reproducibilidad pasaba en Windows
+y fallaba en Linux, con el **precio idéntico bit a bit** y el error estándar
+distinto en 1 ULP. Dos defectos encadenados:
+
+1. Una reducción `reduction(+:...)` de OpenMP **no es reproducible**: el árbol de
+   combinación depende del número de hilos que el runtime decida usar, que puede
+   variar entre ejecuciones de la misma máquina.
+2. La fórmula de varianza de libro de texto, `(Σx² − n·media²)/(n−1)`, resta dos
+   cantidades grandes y casi iguales. Con payoffs del orden de 10 y desviación
+   del orden de 0.15, `Σx²` es unos cuatro órdenes de magnitud mayor que el
+   resultado buscado, así que **amplifica** esa diferencia de 1 ULP por
+   cancelación catastrófica hasta hacerla visible.
+
+El segundo es el defecto real; el primero solo lo destapó. Ahora el núcleo
+acumula en un **número fijo de bloques** —independiente del número de hilos— con
+el algoritmo de Welford, y los combina en orden de índice con la fórmula de Chan,
+Golub y LeVeque. El resultado es **idéntico bit a bit con 1, 2, 4, 8 y 16
+hilos**, y hay una prueba que lo exige. El estimador de varianza se contrasta
+además contra NumPy por una vía independiente, con acuerdo a 1e-12.
+
+Es exactamente el determinismo que el README reclama como requisito de
+auditoría, ahora verificado frente al paralelismo y no solo frente a repetir la
+misma llamada.
+
 **El `standard_error` del QMC crudo se devuelve, pero se declara inválido.** Los
 puntos de una red de Sobol no son independientes, así que la varianza muestral
 sobre las rutas no estima el error del estimador. Para un intervalo de confianza
